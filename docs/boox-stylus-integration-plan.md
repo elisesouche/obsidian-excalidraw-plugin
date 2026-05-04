@@ -343,6 +343,56 @@ This enables `penModeDoubleTapEraser` and `penModeSingleFingerPanning` behaviors
 
 ---
 
+### Phase 2.6: Stylus vs. Finger Input Separation
+
+This is one of the most important design concerns: **how do we ensure that drawing with the stylus draws, while finger touches still pan the canvas and click buttons normally?**
+
+#### How the Web Pointer Events API solves this natively
+
+Every `PointerEvent` carries a `pointerType` field:
+
+| Value | Meaning |
+|---|---|
+| `"pen"` | Physical stylus |
+| `"touch"` | Finger or capacitive touch |
+| `"mouse"` | Mouse or trackpad |
+
+Excalidraw already reads this field. In pen mode, it draws when it sees `"pen"` pointer events and pans when it sees `"touch"` pointer events. All buttons and UI elements respond to any input type. **On a standard tablet that correctly reports input types, no extra work is needed.**
+
+#### How the bridge preserves this separation
+
+In this design, the two input streams are completely independent and arrive through different paths:
+
+| Input | Path to WebView | `pointerType` seen by Excalidraw |
+|---|---|---|
+| Stylus | Onyx SDK → companion app → WebSocket → plugin → `dispatchEvent()` | `"pen"` (set explicitly in `BooxStylusReceiver`) |
+| Finger / touch | Android normal touch dispatch → WebView directly | `"touch"` (set by the OS) |
+
+Because `BooxStylusReceiver` explicitly sets `pointerType: "pen"` on every synthetic event it creates, and finger events arrive naturally from Android with `pointerType: "touch"`, Excalidraw sees exactly the right distinction. Clicking toolbar buttons, panning with one finger, and pinch-to-zoom all continue to work through the normal Android → WebView touch path and are completely unaffected by the companion app.
+
+#### Role of `penModeSingleFingerPanning`
+
+Activating pen mode (§2.5) also activates `penModeSingleFingerPanning`. This is the plugin setting that makes "finger = pan, stylus = draw" work: in pen mode, single-finger touch events are interpreted as panning gestures rather than drawing strokes. This means the user can:
+
+- Draw with the stylus → Excalidraw draws (synthetic `"pen"` events)
+- Pan with one finger → Excalidraw pans (real `"touch"` events + `penModeSingleFingerPanning`)
+- Pinch-to-zoom with two fingers → Excalidraw zooms (real `"touch"` events)
+- Tap any button → normal DOM click (real `"touch"` event)
+
+#### Critical risk: `openRawDrawing()` may swallow finger touches
+
+The only threat to this clean separation is if `openRawDrawing()` on the companion app's overlay causes the Onyx display controller to intercept **all** input — including finger touches — at the driver level, before they reach the Obsidian WebView.
+
+**Mitigations (in order of preference):**
+
+1. **`FLAG_NOT_TOUCHABLE` on the overlay `SurfaceView`** — the overlay window must be created with `WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE`. This tells Android to pass all touch events through to the window behind (Obsidian), while the Onyx SDK's pen-specific raw capture (which operates below the Android input stack) continues to work.
+
+2. **Gate `setRawDrawingEnabled` on pen presence only** — call `touchHelper.setRawDrawingEnabled(true)` only inside `onPenActive()` and clear it in `onEndRawDrawing()`. This minimizes the window during which any touch routing side-effects could occur.
+
+3. **Fallback: skip `openRawDrawing()`, use input-reader only** — if `openRawDrawing()` cannot be used without swallowing finger touches, call `setRawInputReaderEnable(true)` without `openRawDrawing()`. This loses the driver-level event capture that eliminates the Android input dispatch delay (~50–100ms), but preserves normal finger routing.
+
+---
+
 ### Phase 3: Settings UI
 
 Add a new section "Boox Stylus" to the plugin settings panel (`src/core/settings.ts` and the settings tab):
@@ -481,6 +531,146 @@ Until Obsidian exposes such an API, Track A remains the only viable path.
    The Onyx SDK typically captures at 100–200Hz. The WebSocket bridge will add some latency (~1–5ms on localhost). This should be acceptable.
 
 5. **WebSocket security:** The local WebSocket binds to `127.0.0.1`. Is there a risk of other apps on the device connecting to it? On Android, apps are sandboxed – loopback connections from other apps are blocked unless the device is rooted. This should be safe, but worth noting in the companion app's documentation.
+
+---
+
+## Known Weaknesses and Risks
+
+This section catalogs design weaknesses that must be resolved before the implementation is considered production-ready. Items marked 🔴 are **blockers** – they will cause incorrect behavior if unaddressed. Items marked 🟡 are important but not blocking for an initial working prototype.
+
+### 🔴 W1: Coordinate translation formula is incorrect
+
+The sample code in §2.1 contains a bug:
+
+```typescript
+const clientX = event.x - pt.left + this.canvas.offsetLeft;
+const clientY = event.y - pt.top + this.canvas.offsetTop;
+```
+
+`event.x / .y` are **screen-absolute physical pixels** from the Onyx SDK. `getBoundingClientRect()` returns the canvas position in **viewport CSS pixels**. These units are incompatible without two corrections:
+
+1. **WebView screen offset**: the WebView's top-left corner in screen-absolute coordinates must be subtracted. There is no direct JavaScript API for this; it must either be sent from the companion app or estimated from `window.screen` data.
+2. **Device pixel ratio scaling**: screen-absolute physical pixels must be divided by `window.devicePixelRatio` to convert to CSS pixels.
+
+The correct formula is approximately:
+```typescript
+const dpr = window.devicePixelRatio;
+const webViewOffsetX = /* provided by companion app or estimated */;
+const webViewOffsetY = /* provided by companion app or estimated */;
+const clientX = (event.x - webViewOffsetX) / dpr;
+const clientY = (event.y - webViewOffsetY) / dpr;
+```
+
+**Resolution:** The companion app should broadcast the WebView window's screen-absolute position (obtainable via `WindowManager` + `getWindowVisibleDisplayFrame`) alongside stylus events, and the wire protocol must include `dpr`. Alternatively the `StylusEvent` coordinates can be pre-converted to CSS viewport coordinates server-side if the companion app knows the WebView geometry.
+
+---
+
+### 🔴 W2: Auto-reconnect is broken — `enabled` flag is never set
+
+The `BooxStylusReceiver` in §2.1 has a dead reconnection path:
+
+```typescript
+private enabled: boolean = false;   // never set to true
+
+private reconnect() {
+  if (this.enabled) this.connect(this.canvas!);  // never executes
+}
+```
+
+If the WebSocket closes (companion app stopped, device sleep), the plugin silently stops receiving events. Fix: set `this.enabled = true` inside `connect()` and `this.enabled = false` inside `disconnect()`.
+
+---
+
+### 🔴 W3: No `pointercancel` on WebSocket disconnect — Excalidraw gets stuck
+
+If the WebSocket drops while a stroke is in progress (mid-`pointerdown`), no `pointerup` is ever dispatched. Excalidraw remains in drawing mode with a dangling stroke, and the canvas becomes unresponsive to further input until the user manually changes tools or reloads.
+
+**Resolution:** In the WebSocket `onclose` handler, dispatch a synthetic `pointercancel` event on the canvas before attempting reconnection:
+```typescript
+this.ws.onclose = () => {
+  if (this.strokeInProgress) {
+    this.canvas?.dispatchEvent(new PointerEvent("pointercancel", {
+      bubbles: true, pointerType: "pen", pointerId: 1,
+    }));
+    this.strokeInProgress = false;
+  }
+  setTimeout(() => this.reconnect(), 2000);
+};
+```
+
+---
+
+### 🟡 W4: WebSocket throughput at 200Hz
+
+At 200 stylus samples per second, the bridge transmits 200 JSON-framed WebSocket messages per second. Each message has TCP+WebSocket framing overhead (~14–30 bytes) plus JSON serialization overhead. On localhost this is unlikely to saturate bandwidth, but JSON parsing in the JavaScript `onmessage` handler runs on the main thread and may contribute 1–3ms of per-message latency.
+
+**Mitigation options:**
+- Use binary MessagePack encoding instead of JSON (requires a library on both sides).
+- Batch multiple `TouchPoint`s from `onRawDrawingTouchPointListReceived` into a single WebSocket message with a `type: "batch"` wrapper.
+- Accept the latency for a first version; profile before optimizing.
+
+---
+
+### 🟡 W5: No palm rejection
+
+The design forwards all stylus events from `RawInputCallback` but does not address palm rejection (the user's palm resting on the screen while drawing). The Onyx SDK provides an `ExcludeRect` list in `TouchHelper.setLimitRect(bounds, excludeRects)` that can mark regions as "palm zones". Without configuring this, palm contact may generate spurious `pointerdown` events.
+
+**Mitigation:** Initially rely on Excalidraw's existing pen mode behavior (which already ignores `"touch"` events during active pen strokes). For a more robust solution, configure Onyx `ExcludeRect` based on stylus proximity (if hover events are available) to dynamically mark the palm zone.
+
+---
+
+### 🟡 W6: DPI-unaware canvas selector
+
+The code in §2.2 selects the interactive canvas with:
+```typescript
+this.excalidrawContainer?.querySelector("canvas.interactive")
+```
+
+Excalidraw uses a CSS class on the interactive canvas layer, but this is an internal implementation detail that could change in an upstream Excalidraw update. A more resilient approach is to find the canvas by its role in the DOM or to use the `onPointerUpdate` API callback that Excalidraw already exposes via `ExcalidrawImperativeAPI`.
+
+---
+
+### 🟡 W7: `SYSTEM_ALERT_WINDOW` permission friction
+
+The companion app requires `SYSTEM_ALERT_WINDOW` (overlay permission) to display a transparent `SurfaceView` over Obsidian. On Android 6+, this is not a standard install-time permission — users must grant it manually via **Settings → Apps → Special app access → Display over other apps**. This is a significant usability hurdle for non-technical users and must be clearly communicated with a setup guide.
+
+---
+
+### 🟡 W8: Battery and lifecycle management
+
+A foreground service running `TouchHelper` continuously will prevent the CPU from going to a low-power state while Obsidian is in the background. This is particularly noticeable on E-ink devices where battery life is a priority.
+
+**Resolution:** The companion app should monitor Obsidian's foreground state (e.g., via an `ActivityLifecycleCallbacks` broadcast or by the plugin sending a WebSocket "app paused/resumed" message) and pause `TouchHelper` when Obsidian is not visible. Alternatively, expose a manual pause button in the Quick Settings tile.
+
+---
+
+### 🟡 W9: Onyx SDK version fragility
+
+The `TouchHelper.create()` API changed signature between Onyx SDK 1.3.x and 1.4.x, and the callbacks available in `RawInputCallback` vary by firmware version (e.g., `onRawDrawingTouchPointListReceived` was added in a later release). Pinning to `onyxsdk-pen:1.4.11` may fail on Boox devices running older firmware that ships an older bundled SDK.
+
+**Resolution:** Target the lowest common denominator callback set (`onBeginRawDrawing`, `onRawDrawingTouchPointMoveReceived`, `onEndRawDrawing`) which have existed since 1.3.x, and treat `onRawDrawingTouchPointListReceived` as an optional enhancement detected at runtime via `try/catch` or API version check.
+
+---
+
+### 🟡 W10: No `pointerId` for eraser end vs. pen end
+
+The bridge uses a fixed `pointerId: 1` for all synthetic events. Some styluses report the eraser end as a separate tool (`pointerType: "eraser"` in standard browsers). If the Onyx SDK provides eraser events (`onBeginRawErasing`, etc.), these should be dispatched with a distinct `pointerId` (e.g., `2`) to avoid confusing Excalidraw's internal event tracking, which associates strokes by `pointerId`.
+
+---
+
+## Overall Readiness Assessment
+
+**The architecture is sound in concept, but the implementation plan is not yet ready to execute.** Two blockers (W1, W3) must be resolved in the design before writing any code:
+
+1. **W1 (coordinate translation)** is the most critical. Without correct coordinates, every stroke will appear in the wrong place. This requires a concrete decision on how the companion app communicates the WebView's screen-absolute position to the TypeScript receiver, and the wire protocol must be extended to include `devicePixelRatio`.
+
+2. **W3 (no `pointercancel` on disconnect)** will make the canvas routinely get stuck during development/testing when the companion app is restarted, making it difficult to iterate.
+
+Once W1 and W3 are resolved:
+- W2 (reconnect bug) is a 2-line fix.
+- W4–W10 are performance and polish concerns that can be deferred to a second iteration.
+
+The recommended next step is to write a concrete coordinate-translation spec (confirming `TouchPoint` origin via Onyx SDK documentation or device testing) and to extend the wire protocol accordingly, before any Kotlin or TypeScript code is written.
 
 ---
 
