@@ -178,27 +178,48 @@ A minimal local WebSocket server (port 7854, chosen to avoid conflicts):
 ```kotlin
 data class StylusEvent(
     val type: String,          // "pointerdown" | "pointermove" | "pointerup" | "eraser_*"
-    val x: Float,
-    val y: Float,
+    val x: Float,              // screen-absolute physical pixels (from TouchPoint)
+    val y: Float,              // screen-absolute physical pixels (from TouchPoint)
     val pressure: Float,       // 0.0–1.0
     val tiltX: Float,
     val tiltY: Float,
     val timestamp: Long,
+    // Coordinate translation fields (W1 fix) — computed once per session/orientation change:
+    val webViewOffsetX: Float, // left edge of the WebView in physical screen pixels
+    val webViewOffsetY: Float, // top edge of the WebView in physical screen pixels (≈ status bar height)
+    val dpr: Float,            // display density (= window.devicePixelRatio in the WebView)
 )
+```
+
+The companion app computes `webViewOffsetX/Y` and `dpr` once on startup and on every orientation change:
+
+```kotlin
+private fun computeWebViewGeometry(): Triple<Float, Float, Float> {
+    val metrics = resources.displayMetrics
+    val dpr = metrics.density                     // matches window.devicePixelRatio in WebView
+    val rect = Rect()
+    overlayView.getWindowVisibleDisplayFrame(rect) // rect.top = status bar height
+    return Triple(rect.left.toFloat(), rect.top.toFloat(), dpr)
+}
 ```
 
 JSON wire format example:
 ```json
 {
   "type": "pointermove",
-  "x": 412.5,
-  "y": 803.2,
+  "x": 825.0,
+  "y": 1606.4,
   "pressure": 0.65,
   "tiltX": 12.0,
   "tiltY": -5.0,
-  "timestamp": 1714850000123
+  "timestamp": 1714850000123,
+  "webViewOffsetX": 0.0,
+  "webViewOffsetY": 72.0,
+  "dpr": 2.0
 }
 ```
+
+`x` and `y` are raw screen-absolute physical pixels from the Onyx SDK. The TypeScript receiver converts them to CSS viewport coordinates using `webViewOffsetX/Y` and `dpr` (see §2.1).
 
 Use `java-websocket` library (`org.java-websocket:Java-WebSocket`) or Ktor for the server. Bind only to `localhost` (127.0.0.1) for security.
 
@@ -223,38 +244,77 @@ A new module in the plugin that connects to the companion app's WebSocket and tr
 // 2. Translating StylusEvent messages into synthetic PointerEvents
 // 3. Dispatching those events onto the canvas element
 
+interface StylusEventMessage {
+  type: string;
+  x: number;              // screen-absolute physical pixels
+  y: number;              // screen-absolute physical pixels
+  pressure: number;
+  tiltX: number;
+  tiltY: number;
+  timestamp: number;
+  webViewOffsetX: number; // physical pixels from screen left to WebView left edge
+  webViewOffsetY: number; // physical pixels from screen top to WebView top edge (≈ status bar)
+  dpr: number;            // display density = window.devicePixelRatio
+}
+
+const PEN_POINTER_ID = 1;
+const ERASER_POINTER_ID = 2;
+
 export class BooxStylusReceiver {
   private ws: WebSocket | null = null;
   private canvas: HTMLCanvasElement | null = null;
-  private enabled: boolean = false;
+  private enabled: boolean = false;       // W2 fix: tracks intent to stay connected
+  private strokeInProgress: boolean = false; // W3 fix: tracks mid-stroke state
 
   connect(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
+    this.enabled = true;                  // W2 fix: set before opening the socket
     this.ws = new WebSocket("ws://127.0.0.1:7854");
     this.ws.onmessage = (evt) => this.onMessage(JSON.parse(evt.data));
-    this.ws.onclose = () => setTimeout(() => this.reconnect(), 2000);
+    this.ws.onclose = () => {
+      // W3 fix: cancel any in-progress stroke so Excalidraw doesn't get stuck
+      if (this.strokeInProgress) {
+        this.canvas?.dispatchEvent(new PointerEvent("pointercancel", {
+          bubbles: true,
+          pointerType: "pen",
+          pointerId: PEN_POINTER_ID,
+        }));
+        this.strokeInProgress = false;
+      }
+      setTimeout(() => this.reconnect(), 2000);
+    };
   }
 
   private reconnect() {
-    if (this.enabled) this.connect(this.canvas!);
+    if (this.enabled) this.connect(this.canvas!); // W2 fix: now actually executes
   }
 
   private onMessage(event: StylusEventMessage) {
     if (!this.canvas) return;
-    const pt = this.canvas.getBoundingClientRect();
-    // Coordinates from the overlay are screen-absolute; adjust to canvas-relative
-    const clientX = event.x - pt.left + this.canvas.offsetLeft;
-    const clientY = event.y - pt.top + this.canvas.offsetTop;
+
+    // W1 fix: convert screen-absolute physical pixels → CSS viewport pixels.
+    // webViewOffsetX/Y is the physical-pixel position of the WebView's top-left corner
+    // on the physical screen (status bar height for Y, 0 for X on most devices).
+    // dpr converts physical pixels to CSS pixels (same as window.devicePixelRatio).
+    const clientX = (event.x - event.webViewOffsetX) / event.dpr;
+    const clientY = (event.y - event.webViewOffsetY) / event.dpr;
+
+    const isEraser = event.type.startsWith("eraser_");
+    const pointerId = isEraser ? ERASER_POINTER_ID : PEN_POINTER_ID;
 
     // Map event type to PointerEvent type
     const pointerEventType = pointerEventTypeMap[event.type];
     if (!pointerEventType) return;
 
+    // W3 fix: track stroke state so we can cancel on disconnect
+    if (pointerEventType === "pointerdown") this.strokeInProgress = true;
+    if (pointerEventType === "pointerup")   this.strokeInProgress = false;
+
     const syntheticEvent = new PointerEvent(pointerEventType, {
       bubbles: true,
       cancelable: true,
       pointerType: "pen",
-      pointerId: 1,
+      pointerId,          // W10 fix: distinct IDs for pen tip vs. eraser end
       clientX,
       clientY,
       pressure: event.pressure,
@@ -265,18 +325,19 @@ export class BooxStylusReceiver {
   }
 
   disconnect() {
+    this.enabled = false;               // W2 fix: prevent reconnect after explicit disconnect
     this.ws?.close();
     this.ws = null;
   }
 }
 
 const pointerEventTypeMap: Record<string, string> = {
-  pointerdown: "pointerdown",
-  pointermove: "pointermove",
-  pointerup: "pointerup",
-  eraser_begin: "pointerdown",   // switch tool to eraser first
-  eraser_move: "pointermove",
-  eraser_end: "pointerup",
+  pointerdown:   "pointerdown",
+  pointermove:   "pointermove",
+  pointerup:     "pointerup",
+  eraser_begin:  "pointerdown",   // switch tool to eraser first (see §2.4)
+  eraser_move:   "pointermove",
+  eraser_end:    "pointerup",
 };
 ```
 
@@ -300,24 +361,24 @@ this.booxReceiver?.disconnect();
 
 #### 2.3 Coordinate System Translation
 
-The companion app's `TouchPoint` coordinates are **screen-absolute** (full device screen pixels). The Excalidraw canvas sits inside:
+The companion app's `TouchPoint` coordinates are **screen-absolute physical pixels**. A `PointerEvent.clientX/Y` must be in **CSS viewport pixels** (origin = top-left of the WebView viewport). The conversion requires two pieces of information, both provided by the companion app in the wire protocol (see §1.3):
+
+1. **`webViewOffsetX/Y`** — the physical-pixel position of the WebView's top-left corner on the physical screen. The companion app obtains this via `overlayView.getWindowVisibleDisplayFrame(rect)`, where `rect.top` gives the status bar height (the main vertical offset on most devices) and `rect.left` gives the horizontal offset (typically 0).
+
+2. **`dpr`** (display pixel ratio) — `DisplayMetrics.density`, which equals the WebView's `window.devicePixelRatio` on Android. This converts physical pixels to CSS pixels.
+
+The formula (implemented in `onMessage()` in §2.1):
 
 ```
-Android screen
-  └── Obsidian app window
-        └── WebView (may have status bar offset)
-              └── Obsidian workspace
-                    └── Excalidraw leaf pane
-                          └── <canvas> element
+clientX = (touchPoint.x − webViewOffsetX) / dpr
+clientY = (touchPoint.y − webViewOffsetY) / dpr
 ```
 
-The bridge must account for this offset chain. Two options:
+These `clientX/Y` values are then passed directly into the `PointerEvent` constructor. `PointerEvent.clientX/Y` is defined as viewport-relative CSS pixels, which is exactly what Excalidraw's hit-testing and coordinate mapping expect.
 
-**Option A (Simpler):** The companion app reads the `WindowManager` `Display` dimensions and the `SurfaceView` position to compute the absolute offset of the canvas within the screen, then sends coordinates relative to the canvas. This requires the companion app to be aware of the canvas bounds.
+**Why not compute the offset in JavaScript?** `window.screenX/screenY` is not reliably populated in Android WebView, and there is no JavaScript API that exposes the WebView window's position on the physical screen. The companion app (running in the same Android process that manages windows) can obtain this reliably, which is why the offset travels in the wire protocol rather than being computed client-side.
 
-**Option B (More robust):** Send screen-absolute coordinates from the companion app; in the TypeScript receiver, use `element.getBoundingClientRect()` relative to the WebView's top-left to convert to canvas-relative client coordinates.
-
-Option B is recommended because the JavaScript side can always query its own position, while the Android side cannot reliably know the WebView layout.
+**Orientation changes:** When the device rotates, `webViewOffsetX/Y` and `dpr` may change. The companion app should re-query these values in its `onLayoutChange` listener and include the updated values in subsequent events.
 
 #### 2.4 Eraser Tool Handling
 
@@ -538,65 +599,34 @@ Until Obsidian exposes such an API, Track A remains the only viable path.
 
 This section catalogs design weaknesses that must be resolved before the implementation is considered production-ready. Items marked 🔴 are **blockers** – they will cause incorrect behavior if unaddressed. Items marked 🟡 are important but not blocking for an initial working prototype.
 
-### 🔴 W1: Coordinate translation formula is incorrect
+### ✅ W1: Coordinate translation formula — **resolved**
 
-The sample code in §2.1 contains a bug:
+~~The sample code in §2.1 contains a bug...~~
+
+**Resolution (applied in §1.3 and §2.1):** The wire protocol now carries `webViewOffsetX`, `webViewOffsetY` (physical pixels; obtained from `overlayView.getWindowVisibleDisplayFrame()` in the companion app), and `dpr` (`DisplayMetrics.density`). The TypeScript receiver converts with:
 
 ```typescript
-const clientX = event.x - pt.left + this.canvas.offsetLeft;
-const clientY = event.y - pt.top + this.canvas.offsetTop;
+const clientX = (event.x - event.webViewOffsetX) / event.dpr;
+const clientY = (event.y - event.webViewOffsetY) / event.dpr;
 ```
 
-`event.x / .y` are **screen-absolute physical pixels** from the Onyx SDK. `getBoundingClientRect()` returns the canvas position in **viewport CSS pixels**. These units are incompatible without two corrections:
-
-1. **WebView screen offset**: the WebView's top-left corner in screen-absolute coordinates must be subtracted. There is no direct JavaScript API for this; it must either be sent from the companion app or estimated from `window.screen` data.
-2. **Device pixel ratio scaling**: screen-absolute physical pixels must be divided by `window.devicePixelRatio` to convert to CSS pixels.
-
-The correct formula is approximately:
-```typescript
-const dpr = window.devicePixelRatio;
-const webViewOffsetX = /* provided by companion app or estimated */;
-const webViewOffsetY = /* provided by companion app or estimated */;
-const clientX = (event.x - webViewOffsetX) / dpr;
-const clientY = (event.y - webViewOffsetY) / dpr;
-```
-
-**Resolution:** The companion app should broadcast the WebView window's screen-absolute position (obtainable via `WindowManager` + `getWindowVisibleDisplayFrame`) alongside stylus events, and the wire protocol must include `dpr`. Alternatively the `StylusEvent` coordinates can be pre-converted to CSS viewport coordinates server-side if the companion app knows the WebView geometry.
+The companion app re-computes these on every orientation change via its `onLayoutChange` listener.
 
 ---
 
-### 🔴 W2: Auto-reconnect is broken — `enabled` flag is never set
+### ✅ W2: Auto-reconnect is broken — **resolved**
 
-The `BooxStylusReceiver` in §2.1 has a dead reconnection path:
+~~The `BooxStylusReceiver` in §2.1 has a dead reconnection path...~~
 
-```typescript
-private enabled: boolean = false;   // never set to true
-
-private reconnect() {
-  if (this.enabled) this.connect(this.canvas!);  // never executes
-}
-```
-
-If the WebSocket closes (companion app stopped, device sleep), the plugin silently stops receiving events. Fix: set `this.enabled = true` inside `connect()` and `this.enabled = false` inside `disconnect()`.
+**Resolution (applied in §2.1):** `connect()` now sets `this.enabled = true` at the start, and `disconnect()` sets `this.enabled = false`. The `reconnect()` guard now executes correctly. Reconnection is attempted every 2 s after any unintentional close, and stops permanently only when `disconnect()` is called explicitly.
 
 ---
 
-### 🔴 W3: No `pointercancel` on WebSocket disconnect — Excalidraw gets stuck
+### ✅ W3: No `pointercancel` on WebSocket disconnect — **resolved**
 
-If the WebSocket drops while a stroke is in progress (mid-`pointerdown`), no `pointerup` is ever dispatched. Excalidraw remains in drawing mode with a dangling stroke, and the canvas becomes unresponsive to further input until the user manually changes tools or reloads.
+~~If the WebSocket drops while a stroke is in progress...~~
 
-**Resolution:** In the WebSocket `onclose` handler, dispatch a synthetic `pointercancel` event on the canvas before attempting reconnection:
-```typescript
-this.ws.onclose = () => {
-  if (this.strokeInProgress) {
-    this.canvas?.dispatchEvent(new PointerEvent("pointercancel", {
-      bubbles: true, pointerType: "pen", pointerId: 1,
-    }));
-    this.strokeInProgress = false;
-  }
-  setTimeout(() => this.reconnect(), 2000);
-};
-```
+**Resolution (applied in §2.1):** `BooxStylusReceiver` now tracks `strokeInProgress`. The `onclose` handler dispatches a synthetic `pointercancel` event on the canvas when a stroke is in progress, clearing Excalidraw's drawing state before attempting reconnection.
 
 ---
 
@@ -652,25 +682,36 @@ The `TouchHelper.create()` API changed signature between Onyx SDK 1.3.x and 1.4.
 
 ---
 
-### 🟡 W10: No `pointerId` for eraser end vs. pen end
+### ✅ W10: No `pointerId` for eraser end vs. pen end — **resolved**
 
-The bridge uses a fixed `pointerId: 1` for all synthetic events. Some styluses report the eraser end as a separate tool (`pointerType: "eraser"` in standard browsers). If the Onyx SDK provides eraser events (`onBeginRawErasing`, etc.), these should be dispatched with a distinct `pointerId` (e.g., `2`) to avoid confusing Excalidraw's internal event tracking, which associates strokes by `pointerId`.
+~~The bridge uses a fixed `pointerId: 1` for all synthetic events...~~
+
+**Resolution (applied in §2.1):** Pen-tip events use `pointerId: 1` (constant `PEN_POINTER_ID`) and eraser events use `pointerId: 2` (constant `ERASER_POINTER_ID`). Excalidraw's internal tracking correctly associates strokes with their respective pointer IDs.
 
 ---
 
 ## Overall Readiness Assessment
 
-**The architecture is sound in concept, but the implementation plan is not yet ready to execute.** Two blockers (W1, W3) must be resolved in the design before writing any code:
+**The plan is now ready to execute.** The three blockers identified in the initial weakness analysis have been resolved in the design:
 
-1. **W1 (coordinate translation)** is the most critical. Without correct coordinates, every stroke will appear in the wrong place. This requires a concrete decision on how the companion app communicates the WebView's screen-absolute position to the TypeScript receiver, and the wire protocol must be extended to include `devicePixelRatio`.
+1. **W1 (coordinate translation)** — resolved. The wire protocol is extended with `webViewOffsetX`, `webViewOffsetY`, and `dpr`, computed by the companion app from `getWindowVisibleDisplayFrame()` and `DisplayMetrics.density`. The TypeScript receiver applies the correct formula: `clientX = (x − webViewOffsetX) / dpr`. See §1.3 and §2.3.
 
-2. **W3 (no `pointercancel` on disconnect)** will make the canvas routinely get stuck during development/testing when the companion app is restarted, making it difficult to iterate.
+2. **W2 (dead auto-reconnect)** — resolved. `BooxStylusReceiver.connect()` now sets `enabled = true`, and `disconnect()` sets `enabled = false`, making the reconnect path live. See §2.1.
 
-Once W1 and W3 are resolved:
-- W2 (reconnect bug) is a 2-line fix.
-- W4–W10 are performance and polish concerns that can be deferred to a second iteration.
+3. **W3 (no `pointercancel` on disconnect)** — resolved. The `onclose` handler now dispatches a `pointercancel` event when a stroke is in progress, using the `strokeInProgress` flag. See §2.1.
 
-The recommended next step is to write a concrete coordinate-translation spec (confirming `TouchPoint` origin via Onyx SDK documentation or device testing) and to extend the wire protocol accordingly, before any Kotlin or TypeScript code is written.
+Additionally, **W10 (eraser `pointerId`)** was fixed as a zero-cost improvement in the same code block: the pen tip uses `pointerId: 1` and the eraser end uses `pointerId: 2`.
+
+**Remaining items (W4–W9)** are performance, polish, and usability concerns that are appropriate to address in a second iteration after a working prototype is validated on a physical Boox device:
+
+| Item | Severity | Recommended timing |
+|---|---|---|
+| W4: 200Hz JSON throughput | 🟡 | Profile after first prototype; batch if needed |
+| W5: Palm rejection | 🟡 | Second iteration |
+| W6: Fragile canvas selector | 🟡 | Fix if upstream Excalidraw changes break it |
+| W7: SYSTEM_ALERT_WINDOW UX | 🟡 | Document in README before any release |
+| W8: Battery/lifecycle | 🟡 | Second iteration — add pause/resume messages |
+| W9: Onyx SDK version fragility | 🟡 | Limit callbacks to 1.3.x baseline before shipping |
 
 ---
 
